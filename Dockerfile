@@ -10,7 +10,7 @@ FROM chef as builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin portalz-integrator
+RUN cargo build --release --bin eleco-integrator
 
 FROM debian:bullseye-slim AS runtime
 WORKDIR /app
