@@ -1,0 +1,86 @@
+name: eleco-integrator-github-actions
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  APPLICATION_NAME: eleco-integrator
+
+jobs:
+  build-and-test:
+    name: Test and build project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --all-features
+
+  docker:
+    name: Build and Push image to registry
+    env:
+      IMAGE: portalz-registry-dev/${APPLICATION_NAME}
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+      - name: Prepare
+        id: prep
+        run: |
+          echo "APPLICATION_NAME=$(echo $APPLICATION_NAME)" >> $GITHUB_ENV
+          echo "IMAGE_NAME=$(echo portalz-registry-dev/$APPLICATION_NAME)" >> $GITHUB_ENV
+          APPLICATION_NAME=$(echo $APPLICATION_NAME)
+          IMAGE_NAME=$(echo portalz-registry-dev/$APPLICATION_NAME)
+          BRANCH=${GITHUB_REF##*/}
+          REVISION=${GITHUB_SHA::8}
+          BUILD_ID="${BRANCH}-${REVISION}"
+          LATEST_ID=canary
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            BUILD_ID=${GITHUB_REF/refs\/tags\//}
+            LATEST_ID=latest
+          fi
+          echo ::set-output name=APPLICATION_NAME::${APPLICATION_NAME}
+          echo ::set-output name=IMAGE_NAME::${IMAGE_NAME}
+          echo ::set-output name=BUILD_DATE::$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          echo ::set-output name=BUILD_ID::${BUILD_ID}
+          echo ::set-output name=LATEST_ID::${LATEST_ID}
+          echo "TAG=$(echo ${BUILD_ID})" >> $GITHUB_ENV
+      - name: Publish to Registry
+        uses: elgohr/Publish-Docker-Github-Action@v4
+        with:
+          registry: ${{ secrets.REGISTRY_URI }}
+          name: ${{ env.IMAGE_NAME }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+          tags: |
+            ${{ steps.prep.outputs.BUILD_ID }}
+
+  deploy:
+    name: Deploy on Kubernetes via SSH
+    runs-on: ubuntu-latest
+    if: ${{ always() && contains(join(needs.*.result, ','), 'success') }}
+    needs: [ build-and-test, docker ]
+    steps:
+      - name: Set environment variables
+        run: |
+          echo "APPLICATION_NAME=$(echo $APPLICATION_NAME)" >> $GITHUB_ENV
+          echo "Application name: $APPLICATION_NAME"
+          echo "TAG=${GITHUB_REF##*/}-${GITHUB_SHA::8}" >> $GITHUB_ENV
+          echo "Build: $TAG"
+      - name: Deploy image to Kubernetes cluster via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY}}
+          envs: APPLICATION_NAME,TAG
+          script: |
+            kubectl delete deployment $APPLICATION_NAME
+            kubectl create deployment $APPLICATION_NAME --image=rg.fr-par.scw.cloud/portalz-registry-dev/$APPLICATION_NAME:$TAG

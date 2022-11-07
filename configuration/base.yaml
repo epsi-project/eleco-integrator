@@ -1,0 +1,2 @@
+rabbitmq:
+  protocol: amqps
