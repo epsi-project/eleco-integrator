@@ -1,19 +1,13 @@
 use crate::configuration::get_configuration;
-use futures::future::join_all;
 use futures_lite::stream::StreamExt;
-use lapin::{
-    options::*, publisher_confirm::Confirmation, types::FieldTable, BasicProperties, Connection,
-    ConnectionProperties, Consumer, Result,
-};
-use log::{error, info};
+use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties, Consumer, Result};
+use log::{ info, error };
 use secrecy::ExposeSecret;
-use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
-use tokio::time::Duration;
-use tokio_amqp::LapinTokioExt;
+use postgrest::Postgrest;
 
 mod configuration;
+mod models;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,6 +25,7 @@ async fn main() -> Result<()> {
         configuration.rabbitmq.auth.username
     );
 
+    let supabase_client = Postgrest::new(configuration.supabase.uri).insert_header("apikey", configuration.supabase.key.expose_secret());
     let conn = Connection::connect(&rabbitmq_url, ConnectionProperties::default()).await?;
 
     info!(
@@ -94,13 +89,13 @@ async fn main() -> Result<()> {
         .await?;
 
     tokio::select! {
-        _ = run_consumer(&mut production_consumer) => {
+        _ = run_consumer(&mut production_consumer, &supabase_client) => {
             info!("production_consumer finished");
         }
-        _ = run_consumer(&mut consumption_consumer) => {
+        _ = run_consumer(&mut consumption_consumer, &supabase_client) => {
             info!("consumption_consumer finished");
         }
-        _ = run_consumer(&mut storage_consumer) => {
+        _ = run_consumer(&mut storage_consumer, &supabase_client) => {
             info!("storage_consumer finished");
         }
     }
@@ -108,10 +103,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_consumer(consumer: &mut Consumer) {
+async fn run_consumer(consumer: &mut Consumer, supabase_client: &Postgrest) {
     while let Some(delivery) = consumer.next().await {
         let delivery = delivery.expect("error in consumption_consumer");
-        info!("Received message: {:?}", String::from_utf8(delivery.data.to_vec()).expect("Message is not a valid utf8"));
+        let measure = String::from_utf8(delivery.data.to_vec()).expect("Error in deserialization");
+        info!(
+            "Received message: {}",
+            measure
+        );
+        match supabase_client.from(consumer.queue().to_string()).insert(measure).execute().await {
+            Ok(r) if !r.status().is_success() => error!("Error in query status: {} -> {}", r.status(), r.text().await.unwrap()),
+            Err(e) => {
+                error!("Error in query: {:?}", e);
+                continue
+            },
+            _ => (),
+        };
         delivery.ack(BasicAckOptions::default()).await.expect("ack");
     }
 }
